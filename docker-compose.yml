@@ -1,0 +1,23 @@
+version: '3'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:5.4.0
+    #container_name: zookeeper
+    hostname: zookeeper
+    env_file:
+      - ./dev/conf
+    ports:
+      - 2181:2181
+
+  kafka:
+    image: confluentinc/cp-enterprise-kafka:5.4.0
+    #container_name: kafka
+    hostname: kafka
+    env_file:
+      - ./dev/conf
+    depends_on:
+      - zookeeper
+    ports:
+      - 29092:29092
+      - 9092:9092
