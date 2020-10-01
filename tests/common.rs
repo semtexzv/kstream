@@ -6,7 +6,7 @@ use rdkafka::admin::AdminOptions;
 use log::{*};
 
 pub fn cfg() -> Config {
-    Config::new()
+    Config::new("kstream-tests")
         .set("bootstrap.servers", "localhost:29092")
         .set("auto.offset.reset", "earliest")
 }

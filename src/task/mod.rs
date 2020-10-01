@@ -1,13 +1,20 @@
 use crate::{KStream, Config, KVStore, KTable};
 use crate::format::Format;
 use crate::stream::topic::{RawConsumer, TypedConsumer, TypedProducer, RawProducer};
-use crate::stream::{Change, KSink};
+use crate::stream::{StreamItem, KSink, Map, Filter};
 use serde::export::PhantomData;
-use crate::stream::map::Map;
-use crate::table::TableImpl;
-use crate::stream::grouped::{Grouped, GroupedTable, Aggregate};
+
+use crate::table::{TableImpl, Change};
+use crate::stream::grouped::{Grouped, AggregateTable, Aggregate};
 use crate::store::Partitioned;
-use crate::stream::filter::Filter;
+
+
+// A way to add names to existing stores / streams
+pub trait Named<T> {
+    fn with_name(&mut self, name: String) -> T;
+}
+
+
 
 /// Task is a base unit of computation,
 /// Each task constitutes a consumer group.
@@ -84,7 +91,7 @@ impl<S: KStream> Task<S> {
         };
     }
 
-    pub async fn to<KF, VF>(mut self, name: &str) -> !
+     pub async fn to<KF, VF>(mut self, name: &str) -> !
         where KF: Format<Item=S::Key>,
               VF: Format<Item=S::Value>
     {
@@ -95,10 +102,10 @@ impl<S: KStream> Task<S> {
         info!("Sink enter");
         loop {
             match self._stream.next().await {
-                Change::Rebalance(_) => {
+                StreamItem::Rebalance(_) => {
                     error!("Rebalancing in sink");
                 }
-                Change::Item(part, key, val) => {
+                StreamItem::Item(part, key, val) => {
                     info!("Sinking item");
                     sink.send_next(Some(part), &key, val.as_ref()).await;
                 }
@@ -109,10 +116,44 @@ impl<S: KStream> Task<S> {
 
 impl<T> Task<T>
     where T: KTable
-{}
+{
+    pub async fn poll(mut self) -> ! {
+        loop {
+            let _ = self._stream.next().await;
+            //self._stream.poll().await;
+        }
+    }
+
+    pub async fn to_todo<KF, VF>(mut self, name: &str) -> !
+        where KF: Format<Item=T::Key>,
+              VF: Format<Item=T::Value>
+    {
+        let mut sink = TypedProducer::<KF, VF> {
+            raw: RawProducer::new(&self.cfg, name),
+            _marker: PhantomData,
+        };
+        info!("Sink enter");
+        loop {
+            match self._stream.next().await {
+                (k, Change::New(v)) => {
+                    info!("New item");
+                    sink.send_next(None, &k, Some(&v)).await
+                }
+                (k, Change::Modified(_, v)) => {
+                    info!("Modified");
+                    sink.send_next(None, &k, Some(&v)).await;
+                }
+                (k, Change::Removed(_)) => {
+                    info!("Removed");
+                    sink.send_next(None, &k, None).await;
+                }
+            }
+        }
+    }
+}
 
 impl<S: KStream> Task<Grouped<S>> {
-    pub fn aggregate<AGG, KF, AF, ST>(self) -> Task<GroupedTable<S, AGG, KF, AF, ST>>
+    pub fn aggregate<AGG, KF, AF, ST>(self, agg: AGG) -> Task<AggregateTable<S, AGG, KF, AF, ST>>
         where AGG: Aggregate<S::Key, S::Value>,
               KF: Format<Item=S::Key>,
               AF: Format<Item=AGG::Item>,
@@ -120,9 +161,10 @@ impl<S: KStream> Task<Grouped<S>> {
     {
         Task {
             cfg: self.cfg.clone(),
-            _stream: GroupedTable {
+            _stream: AggregateTable {
                 stream: self._stream.stream,
                 inner: Partitioned::new(self.cfg, "TODO".to_string()),
+                agg,
             },
             name: self.name,
 

@@ -1,7 +1,6 @@
 #[macro_use]
 extern crate log;
 
-use rdkafka::admin::AdminOptions;
 
 mod common;
 
@@ -16,6 +15,8 @@ use kstream::task::Task;
 use std::time::Duration;
 
 use futures::future::FutureExt;
+use kstream::stream::grouped::{Count, ArgMin};
+use kstream::store::InMemory;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct User {
@@ -25,14 +26,14 @@ struct User {
 }
 
 #[tokio::test]
-async fn test_topics() {
+async fn main() {
     init();
     clear_topics().await;
     let cfg = cfg();
 
     let mut producer = TypedProducer::<JSON<i32>, JSON<_>>::from(RawProducer::new(&cfg, "users"));
 
-    for i in 0..10 {
+    for _ in 0..10 {
         producer.send_next(None, &0, Some(&User {
             name: "Abott".to_string(),
             email: "frankie@gmail.com".to_string(),
@@ -61,7 +62,7 @@ async fn test_topics() {
         .to::<JSON<_>, JSON<bool>>("users_status");
 
 
-    let t2 = Task::new(cfg, "invalid_detector")
+    let t2 = Task::new(cfg.clone(), "invalid_detector")
         .stream::<JSON<usize>, JSON<bool>>("users_status")
         .filter(|k, v| {
             info!("Filtering by status {:?}", k);
@@ -69,22 +70,54 @@ async fn test_topics() {
         })
         .to::<JSON<_>, JSON<bool>>("users_valid");
 
-    let t3 = tokio::time::timeout(Duration::from_secs(15), futures::future::pending::<()>());
+    let t3 = tokio::time::timeout(Duration::from_secs(10), futures::future::pending::<()>());
     let _res = tokio::select! {
         _ = t1.fuse() => (),
         _ = t2.fuse() => (),
         _ = t3.fuse() => (),
     };
     assert!(get_topics().contains(&"users_valid".to_string()));
-    info!("OK")
 }
 
-/*
 #[tokio::test]
-async fn test_agg() {
-    //init();
-    clear_topics().await;
+async fn test2() {
+    init();
     let cfg = cfg();
+    // Test aggregates
+    let t3 = Task::new(cfg, "aggregates-fuck23")
+        .stream::<JSON<usize>, JSON<bool>>("users_valid")
+        .group()
+        //.aggregate::<_, JSON<usize>, JSON<u64>, InMemory<_, _>>(Count{})
+        .aggregate::<_, JSON<usize>, JSON<_>, InMemory<_, _>>(ArgMin::new(|&k: &usize, &v: &bool| (k, v)))
+        .to_todo::<JSON<_>, JSON<_>>("fuck").await;
 }
 
- */
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Ohlc {
+    pair_id: i64,
+    time: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    vol: f64,
+}
+
+
+#[tokio::test]
+async fn fintech() {
+    init();
+    let cfg = cfg();
+    let t = Task::new(cfg, "fin")
+        .stream::<JSON<String>, JSON<Ohlc>>("ingest");
+
+//        .partition_by(|_, v : Ohlc| v.pair_id)
+    //     .join()
+    // Take OHLC
+    // Remap to pair_id -> ohlc
+    // Join to global period keys
+    // Regroup to pair_id, period, time / period * period -> ohlc
+    // Aggregate ohlc
+    // Present as table
+}

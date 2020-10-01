@@ -1,5 +1,5 @@
 use rdkafka::producer::{BaseRecord, BaseProducer, FutureProducer, FutureRecord};
-use crate::stream::{KSink, Change};
+use crate::stream::{KSink, StreamItem};
 use crate::format::Format;
 use crate::{KStream, Config};
 use std::marker::PhantomData;
@@ -62,7 +62,7 @@ impl RawConsumer {
         self.base.assign(&list).unwrap();
     }
 
-    pub async fn poll_next<KF: Format, VF: Format>(&mut self) -> Change<KF::Item, VF::Item> {
+    pub async fn poll_next<KF: Format, VF: Format>(&mut self) -> StreamItem<KF::Item, VF::Item> {
         loop {
             let rebalanced = self.base.get_base_consumer().context().rebalance_changed.load(Ordering::SeqCst);
             if rebalanced {
@@ -74,21 +74,21 @@ impl RawConsumer {
                     p.partition()
                 }).collect();
                 self.base.get_base_consumer().context().rebalance_changed.store(false, Ordering::SeqCst);
-                return Change::Rebalance(parts);
+                return StreamItem::Rebalance(parts);
             }
             if let Some(msg) = self.base.poll(Duration::from_millis(1)) {
                 match msg {
                     Ok(message) => {
                         let key = KF::deserialize(message.key().unwrap());
                         let val = message.payload().map(VF::deserialize);
-                        return Change::Item(message.partition(), key, val);
+                        return StreamItem::Item(message.partition(), key, val);
                     }
                     e => {
                         panic!("e {:?}", e);
                     }
                 }
             } else {
-                let _ = tokio::time::timeout(Duration::from_millis(1), futures::future::pending::<()>()).await;
+                let _ = tokio::time::timeout(Duration::from_millis(100), futures::future::pending::<()>()).await;
             }
         }
     }
@@ -106,7 +106,7 @@ impl<KF, VF> KStream for TypedConsumer<KF, VF>
     type Key = KF::Item;
     type Value = VF::Item;
 
-    async fn next(&mut self) -> Change<Self::Key, Self::Value> {
+    async fn next(&mut self) -> StreamItem<Self::Key, Self::Value> {
         self.raw.poll_next::<KF, VF>().await
     }
 }

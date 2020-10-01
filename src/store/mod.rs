@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use crate::format::Format;
 use std::marker::PhantomData;
 use crate::{Config, KStream};
-use crate::stream::{Change, KSink};
+use crate::stream::{StreamItem, KSink};
 use std::hash::Hash;
 use crate::stream::topic::{TypedProducer, RawConsumer, RawProducer, TypedConsumer};
+use std::collections::hash_map::Entry;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -19,9 +20,9 @@ pub struct StoreConfig {
 pub trait KVStore<K, V> {
     async fn new(cfg: StoreConfig) -> Self where Self: Sized;
     async fn poll(&mut self);
-    fn get(&mut self, key: &K) -> Option<&V>;
-    fn put(&mut self, key: K, value: V);
-    fn delete(&mut self, key: &K) -> Option<V>;
+    async fn get<'a>(&'a mut self, key: &K) -> Option<&'a V>;
+    async fn put(&mut self, key: K, value: V) -> Option<V>;
+    async fn delete(&mut self, key: &K) -> Option<V>;
 }
 
 
@@ -46,23 +47,23 @@ impl<KF: Format, VF: Format, S: KVStore<KF::Item, VF::Item>> KVStore<KF::Item, V
         let (_, until) = changelog.raw.offset_range(cfg.partiton);
         let mut last = 0;
 
-
         let desired_part = cfg.partiton;
         let mut store = S::new(cfg.clone()).await;
 
+        trace!("Loading changelog until {:?}", until);
         // Load all available messages and rebuild state from them
         while last < until {
             match changelog.next().await {
-                Change::Rebalance(p) => {
+                StreamItem::Rebalance(p) => {
                     panic!("Changelog topics can't be externally rebalanced")
                 }
                 // TODO: Implement handling nulls for deletion
-                Change::Item(part, k, v) => {
+                StreamItem::Item(part, k, v) => {
                     assert_eq!(part, desired_part, "Partition changed at runtime");
                     if let Some(v) = v {
-                        store.put(k, v);
+                        store.put(k, v).await;
                     } else {
-                        store.delete(&k);
+                        store.delete(&k).await;
                     }
 
                     // TODO: This is so wrong, it'll never work - change it
@@ -70,6 +71,7 @@ impl<KF: Format, VF: Format, S: KVStore<KF::Item, VF::Item>> KVStore<KF::Item, V
                 }
             }
         }
+        trace!("Finished loading changelog");
         return Self {
             store,
             part: desired_part,
@@ -83,33 +85,33 @@ impl<KF: Format, VF: Format, S: KVStore<KF::Item, VF::Item>> KVStore<KF::Item, V
 
     async fn poll(&mut self) {
         match self.consumer.next().await {
-            Change::Rebalance(_) => {
+            StreamItem::Rebalance(_) => {
                 panic!("Rebalance shouldn't occur on changelog topics");
             }
-            Change::Item(part, k, v) => {
+            StreamItem::Item(part, k, v) => {
                 if let Some(v) = v {
-                    self.put(k, v)
+                    self.put(k, v).await;
                 } else {
-                    self.delete(&k);
+                    self.delete(&k).await;
                 }
             }
         }
         self.store.poll().await;
     }
 
-    fn get(&mut self, key: &KF::Item) -> Option<&VF::Item> {
-        self.store.get(key)
+    async fn get<'a>(&'a mut self, key: &KF::Item) -> Option<&'a VF::Item> {
+        self.store.get(key).await
     }
 
-    fn put(&mut self, key: KF::Item, value: VF::Item) {
+    async fn put(&mut self, key: KF::Item, value: VF::Item) -> Option<VF::Item> {
         // TODO: Fix emitting of messages here
-        //self.producer.raw.send::<KF, VF>(Some(self.part), &key, Some(&value));
-        self.store.put(key, value);
+        self.producer.raw.send::<KF, VF>(Some(self.part), &key, Some(&value)).await;
+        self.store.put(key, value).await
     }
 
-    fn delete(&mut self, key: &KF::Item) -> Option<VF::Item> {
-        //self.producer.send_next(Some(self.part), key, None);
-        self.store.delete(key)
+    async fn delete(&mut self, key: &KF::Item) -> Option<VF::Item> {
+        self.producer.send_next(Some(self.part), key, None).await;
+        self.store.delete(key).await
     }
 }
 
@@ -129,15 +131,15 @@ impl<K: Hash + Eq, V> KVStore<K, V> for InMemory<K, V> {
     async fn poll(&mut self) {}
 
 
-    fn get(&mut self, key: &K) -> Option<&V> {
+    async fn get<'a>(&'a mut self, key: &K) -> Option<&'a V> {
         self.inner.get(key)
     }
 
-    fn put(&mut self, key: K, value: V) {
-        self.inner.insert(key, value);
+    async fn put(&mut self, key: K, value: V) -> Option<V>{
+        self.inner.insert(key, value)
     }
 
-    fn delete(&mut self, key: &K) -> Option<V> {
+    async fn delete(&mut self, key: &K) -> Option<V> {
         self.inner.remove(key)
     }
 }
@@ -169,7 +171,6 @@ impl<S, K, V> Partitioned<S, K, V>
     }
 
     pub async fn repartition(&mut self, added: Vec<i32>, removed: Vec<i32>) {
-
         for new in added {
             self.stores.insert(new, S::new(StoreConfig {
                 global: self.global.clone(),
@@ -184,27 +185,36 @@ impl<S, K, V> Partitioned<S, K, V>
         }
     }
 
-    pub fn get(&mut self, part: i32, key: &K) -> Option<&V> {
-        return self.stores.get_mut(&part).and_then(|s| s.get(key));
+    pub async fn get<'a>(&'a mut self, part: i32, key: &K) -> Option<&'a V> {
+        if let Some(v) = self.stores.get_mut(&part) {
+            v.get(key).await
+        } else {
+            None
+        }
     }
 
-    pub fn put(&mut self, part: i32, key: K, value: V) {
+    pub async fn put(&mut self, part: i32, key: K, value: V) -> Option<V> {
         // TODO: a lot of copying
         let global = self.global.clone();
         let name = self.name.clone();
-        /*
-        self.stores.entry(part)
-            .or_insert_with(|| S::new(StoreConfig {
-                global,
-                partiton: part,
-                name,
-            }))
-            .put(key, value)
-         */
+        match self.stores.entry(part) {
+            Entry::Vacant(v) => {
+                v.insert(S::new(StoreConfig {
+                    global,
+                    partiton: part,
+                    name,
+                }).await);
+            }
+            _ => {}
+        };
+
+        self.stores.get_mut(&part).unwrap().put(key, value).await
     }
-    pub fn delete(&mut self, part: i32, key: &K) {
+    pub async fn delete(&mut self, part: i32, key: &K) -> Option<V> {
         if let Some(p) = self.stores.get_mut(&part) {
-            p.delete(key);
+            p.delete(key).await
+        } else {
+            None
         }
     }
 }
